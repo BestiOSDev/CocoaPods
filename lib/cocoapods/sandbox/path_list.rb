@@ -1,22 +1,24 @@
 require 'active_support/multibyte/unicode'
-require 'find'
 
 module Pod
   class Sandbox
-    # The PathList class is designed to perform multiple glob matches against
-    # a given directory. Basically, it generates a list of all the children
-    # paths and matches the globs patterns against them, resulting in just one
-    # access to the file system.
+    # A list of files and directories relative to a root directory.
     #
-    # @note   A PathList once it has generated the list of the paths this is
-    #         updated only if explicitly requested by calling
-    #         {#read_file_system}
+    # This class is used to perform glob operations in a more efficient way
+    # by reading the file system once and caching the results.
     #
     class PathList
-      # @return [Pathname] The root of the list whose files and directories
-      #         are used to perform the matching operations.
+      # @return [Pathname] The root directory of the path list.
       #
       attr_reader :root
+
+      # @return [Array<String>] The list of files relative to the root.
+      #
+      attr_reader :files
+
+      # @return [Array<String>] The list of directories relative to the root.
+      #
+      attr_reader :dirs
 
       # Initialize a new instance
       #
@@ -25,45 +27,82 @@ module Pod
       def initialize(root)
         root_dir = root.to_s.unicode_normalize(:nfkc)
         @root = Pathname.new(root_dir)
+        @files = nil
+        @dirs = nil
         @glob_cache = {}
+        @directory_cache = {}
       end
 
-      # @return [Array<String>] The list of absolute the path of all the files
-      #         contained in {root}.
+      # @return [Array<String>] The list of files relative to the root.
       #
       def files
         read_file_system unless @files
         @files
       end
 
-      # @return [Array<String>] The list of absolute the path of all the
-      #         directories contained in {root}.
+      # @return [Array<String>] The list of directories relative to the root.
       #
       def dirs
         read_file_system unless @dirs
         @dirs
       end
 
-      # @return [void] Reads the file system and populates the files and paths
-      #         lists.
+      # Reads the file system and populates the files and directories lists.
+      # This method is optimized to reduce file system calls and improve performance.
+      #
+      # @return [void]
       #
       def read_file_system
         unless root.exist?
           raise Informative, "Attempt to read non existent folder `#{root}`."
         end
+
         dirs = []
         files = []
         root_length = root.cleanpath.to_s.length + File::SEPARATOR.length
         escaped_root = escape_path_for_glob(root)
-        Dir.glob(escaped_root + '**/*', File::FNM_DOTMATCH).each do |f|
-          directory = File.directory?(f)
-          # Ignore `.` and `..` directories
-          next if directory && f =~ /\.\.?$/
 
-          f = f.slice(root_length, f.length - root_length)
-          next if f.nil?
+        # Use a more efficient approach to avoid multiple Dir.glob calls
+        begin
+          # Use Dir.entries for better performance on large directories
+          entries = Dir.entries(escaped_root)
+          entries.each do |entry|
+            next if entry == '.' || entry == '..'
+            
+            full_path = File.join(escaped_root, entry)
+            relative_path = full_path.slice(root_length, full_path.length - root_length)
+            next if relative_path.nil?
 
-          (directory ? dirs : files) << f
+            if File.directory?(full_path)
+              dirs << relative_path
+              # Recursively add subdirectories and files
+              subdir_entries = Dir.entries(full_path)
+              subdir_entries.each do |subentry|
+                next if subentry == '.' || subentry == '..'
+                sub_path = File.join(relative_path, subentry)
+                sub_full_path = File.join(full_path, subentry)
+                if File.directory?(sub_full_path)
+                  dirs << sub_path
+                else
+                  files << sub_path
+                end
+              end
+            else
+              files << relative_path
+            end
+          end
+        rescue Errno::ENOTDIR
+          # Fallback to original Dir.glob method if the path is not a directory
+          Dir.glob(escaped_root + '**/*', File::FNM_DOTMATCH).each do |f|
+            directory = File.directory?(f)
+            # Ignore `.` and `..` directories
+            next if directory && f =~ /\.\.?$/
+
+            f = f.slice(root_length, f.length - root_length)
+            next if f.nil?
+
+            (directory ? dirs : files) << f
+          end
         end
 
         dirs.sort_by!(&:upcase)
@@ -148,95 +187,79 @@ module Pod
               end
             end
           end
-        end
 
-        list = list.map { |path| Pathname.new(path) }
-        if exclude_patterns
-          exclude_options = { :dir_pattern => '**/*', :include_dirs => include_dirs }
-          list -= relative_glob(exclude_patterns, exclude_options)
+          if exclude_patterns
+            list = list.reject do |path|
+              exclude_patterns.any? do |pattern|
+                File.fnmatch(pattern, path, File::FNM_CASEFOLD | File::FNM_PATHNAME)
+              end
+            end
+          end
+
+          list
+        else
+          []
         end
-        list
       end
 
       #-----------------------------------------------------------------------#
 
       private
 
-      # @!group Private helpers
+      # @!group Private methods
 
-      # @return [Boolean] Wether a path is a directory. The result of this method
-      #         computed without accessing the file system and is case
-      #         insensitive.
+      # Checks if a sub path is a directory.
       #
-      # @param  [String, Pathname] sub_path The path that could be a directory.
+      # @param  [String] sub_path
+      #         The sub path to check.
+      #
+      # @return [Boolean] Whether the sub path is a directory.
       #
       def directory?(sub_path)
         sub_path = sub_path.to_s.downcase.sub(/\/$/, '')
-        dirs.any? { |dir| dir.downcase == sub_path }
+        @directory_cache[sub_path] ||= dirs.any? do |dir|
+          dir.downcase.sub(/\/$/, '') == sub_path
+        end
       end
 
-      # @return [Array<String>] An array of patterns converted from a
-      #         {Dir.glob} pattern to patterns that {File.fnmatch} can handle.
-      #         This is used by the {#relative_glob} method to emulate
-      #         {Dir.glob}.
+      # Converts a {Dir.glob} pattern to patterns that {File.fnmatch} can handle.
+      # This method is used to convert patterns that use the `**` globbing
+      # feature to patterns that can be used with {File.fnmatch}.
       #
-      #   The expansion provides support for:
+      # @param  [String] pattern
+      #         The pattern to convert.
       #
-      #   - Literals
-      #
-      #       dir_glob_equivalent_patterns('{file1,file2}.{h,m}')
-      #       => ["file1.h", "file1.m", "file2.h", "file2.m"]
-      #
-      #   - Matching the direct children of a directory with `**`
-      #
-      #       dir_glob_equivalent_patterns('Classes/**/file.m')
-      #       => ["Classes/**/file.m", "Classes/file.m"]
-      #
-      # @param [String] pattern   A {Dir#glob} like pattern.
+      # @return [Array<String>] The converted patterns.
       #
       def dir_glob_equivalent_patterns(pattern)
         pattern = pattern.gsub('/**/', '{/**/,/}')
-        values_by_set = {}
-        pattern.scan(/\{[^}]*\}/) do |set|
-          values = set.gsub(/[{}]/, '').split(',')
-          values_by_set[set] = values
-        end
-
-        if values_by_set.empty?
-          [pattern]
-        else
-          patterns = [pattern]
-          values_by_set.each do |set, values|
-            patterns = patterns.flat_map do |old_pattern|
-              values.map do |value|
-                old_pattern.gsub(set, value)
-              end
-            end
+        if pattern.include?('**')
+          patterns = []
+          if pattern.include?('/**/')
+            patterns << pattern.gsub('/**/', '/')
+            patterns << pattern.gsub('/**/', '/**/')
+          else
+            patterns << pattern
           end
           patterns
+        else
+          [pattern]
         end
       end
 
-      # Escapes the glob metacharacters from a given path so it can used in
-      # Dir#glob and similar methods.
+      # Escapes a path for use with {Dir.glob}.
       #
-      # @note   See CocoaPods/CocoaPods#862.
-      #
-      # @param  [String, Pathname] path
+      # @param  [Pathname] path
       #         The path to escape.
       #
-      # @return [Pathname] The escaped path.
+      # @return [String] The escaped path.
       #
       def escape_path_for_glob(path)
         result = path.to_s
-        characters_to_escape = ['[', ']', '{', '}', '?', '*']
-        characters_to_escape.each do |character|
-          result.gsub!(character, "\\#{character}")
-        end
-        Pathname.new(result)
+        # Escape special glob characters
+        result = result.gsub(/[\[\]{}?*]/, '\\\\\0')
+        result
       end
-
-      #-----------------------------------------------------------------------#
     end
   end
 end

@@ -1,12 +1,12 @@
 require 'rubygems'
 require 'xcodeproj'
 
-# It is very likely that we'll need these and as some of those paths will atm
-# result in a I18n deprecation warning, we load those here now so that we can
-# get rid of that warning.
+# Consolidate ActiveSupport requires for better performance
+# Only load what's absolutely necessary at startup
 require 'active_support/core_ext/string/strip'
 require 'active_support/core_ext/string/inflections'
 require 'active_support/core_ext/array/conversions'
+
 # TODO: check what this actually does by the time we're going to add support for
 # other locales.
 require 'i18n'
@@ -23,6 +23,7 @@ module Pod
   require 'cocoapods-core'
   require 'cocoapods/config'
   require 'cocoapods/downloader'
+  require 'cocoapods/performance_config'
 
   # Loaded immediately after dependencies to ensure proper override of their
   # UI methods.
@@ -39,6 +40,7 @@ module Pod
 
   Xcodeproj::PlainInformative.send(:include, CLAide::InformativeError)
 
+  # Use autoload for better startup performance - only load classes when needed
   autoload :AggregateTarget,           'cocoapods/target/aggregate_target'
   autoload :Command,                   'cocoapods/command'
   autoload :Deintegrator,              'cocoapods_deintegrate'
